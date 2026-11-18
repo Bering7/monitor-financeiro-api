@@ -4,7 +4,7 @@ import re
 import uuid
 import logging
 import unicodedata
-from typing import List, Optional, Any, Dict
+from typing import List, Optional, Any, Dict, Tuple
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -98,7 +98,7 @@ class SalvarLoteRequest(BaseModel):
 # ==============================================================================
 # 4. REGRAS DO MOTOR DE AUTO-CATEGORIZAÇÃO POR PALAVRAS-CHAVE
 # ==============================================================================
-# Regras solicitadas pelo usuário com palavras-chave ordenadas por relevância
+# Categorias de Despesas por palavras-chave solicitadas e comuns
 REGRAS_CATEGORIAS = [
     (
         "Transporte",
@@ -138,38 +138,68 @@ REGRAS_CATEGORIAS = [
     )
 ]
 
-PALAVRAS_RECEITA_EXPLICITA = [
-    "SALARIO", "PRO-LABORE", "REMUNERACAO", "RENDIMENTO", "DOC RECEBIDA",
-    "TED RECEBIDA", "PIX RECEBIDO", "TRANSFERENCIA RECEBIDA", "DEPOSITO RECEBIDO",
-    "ESTORNO", "REEMBOLSO", "DIVIDENDOS", "PROVENTOS"
+# Palavras-chave que identificam inequivocamente ENTRADAS / RECEITAS de caixa
+# (Garantem que valores positivos como Pix recebidos, estornos e resgates de CDB sejam contabilizados)
+PALAVRAS_ENTRADA_GARANTIDA = [
+    "ESTORNO", "RESGATE", "PIX RECEBIDO", "PIX REC", "TED RECEBIDA", "TED REC",
+    "DOC RECEBIDA", "DOC REC", "TRANSFERENCIA RECEBIDA", "TRANSF RECEBIDA",
+    "DEPOSITO RECEBIDO", "DEP RECEBIDO", "SALARIO", "REMUNERACAO", "PRO-LABORE",
+    "RENDIMENTO", "REEMBOLSO", "DIVIDENDOS", "PROVENTOS", "CDB LIQUIDEZ",
+    "APLICACAO RESGATE", "RESGATE INVEST", "CREDITO DE", "RECEBIMENTO"
 ]
 
-def auto_categorizar_transacao(descricao: str, valor: float) -> tuple[str, str]:
+def auto_categorizar_transacao(descricao: str, valor: float) -> Tuple[str, str, float]:
     """
-    Classifica a transação em 'Receita' ou 'Despesa' e aplica o motor de palavras-chave.
-    Retorna a tupla (tipo, categoria).
+    Classifica a transação em 'Receita' ou 'Despesa', aplica o motor de palavras-chave
+    e assegura que estornos, resgates de investimentos e recebimentos sejam tratados como
+    entradas de caixa positivas (Receita).
+    Retorna uma tupla (tipo, categoria, valor_ajustado).
     """
     desc_limpa = (descricao or "").upper().strip()
     
-    # 1. Determinação do Tipo: Receita (>= 0) ou Despesa (< 0)
-    tipo = "Receita" if valor >= 0 else "Despesa"
+    # 1. Verifica se a transação é garantidamente uma ENTRADA (Receita / Inflow)
+    is_entrada_garantida = any(termo in desc_limpa for termo in PALAVRAS_ENTRADA_GARANTIDA)
+    
+    if is_entrada_garantida:
+        tipo = "Receita"
+        valor_ajustado = abs(valor)  # Força sinal positivo para entradas de caixa
+        
+        if "ESTORNO" in desc_limpa:
+            # Identifica se é estorno de uma categoria conhecida
+            for cat, keywords in REGRAS_CATEGORIAS:
+                if any(kw in desc_limpa for kw in keywords):
+                    return tipo, f"Estorno ({cat})", valor_ajustado
+            return tipo, "Estorno / Reembolso", valor_ajustado
+        elif "RESGATE" in desc_limpa or "CDB" in desc_limpa:
+            return tipo, "Resgate / Investimento", valor_ajustado
+        elif any(termo in desc_limpa for termo in ["SALARIO", "REMUNERACAO", "PRO-LABORE"]):
+            return tipo, "Salário / Renda", valor_ajustado
+        elif any(termo in desc_limpa for termo in ["RENDIMENTO", "DIVIDENDOS", "PROVENTOS"]):
+            return tipo, "Rendimentos / Investimentos", valor_ajustado
+        elif "REEMBOLSO" in desc_limpa:
+            return tipo, "Reembolso", valor_ajustado
+        else:
+            return tipo, "Receitas / Transferências", valor_ajustado
 
-    # 2. Tratamento para Receitas
-    if tipo == "Receita":
-        if any(termo in desc_limpa for termo in PALAVRAS_RECEITA_EXPLICITA):
-            return tipo, "Receitas / Renda"
+    # 2. Se o valor for positivo (>= 0), é uma Receita
+    if valor >= 0:
+        tipo = "Receita"
+        valor_ajustado = valor
         for cat, keywords in REGRAS_CATEGORIAS:
             if any(kw in desc_limpa for kw in keywords):
-                return tipo, f"Receita ({cat})"
-        return tipo, "Receita"
+                return tipo, f"Receita ({cat})", valor_ajustado
+        return tipo, "Receita", valor_ajustado
 
-    # 3. Categorização de Despesas por palavras-chave
+    # 3. Categorização de Despesas (valor < 0)
+    tipo = "Despesa"
+    valor_ajustado = valor  # Mantém negativo para visualização na prévia
+
     for cat, keywords in REGRAS_CATEGORIAS:
         if any(kw in desc_limpa for kw in keywords):
-            return tipo, cat
+            return tipo, cat, valor_ajustado
 
-    # Categoria padrão de fallback conforme os requisitos
-    return tipo, "Outros / Despesa Variável"
+    # Categoria padrão de fallback
+    return tipo, "Outros / Despesa Variável", valor_ajustado
 
 # ==============================================================================
 # 5. FUNÇÕES AUXILIARES DE PROCESSAMENTO DE DADOS (PANDAS & LIMPEZA)
@@ -177,12 +207,16 @@ def auto_categorizar_transacao(descricao: str, valor: float) -> tuple[str, str]:
 def limpar_valor_monetario(val: Any) -> float:
     """
     Converte com segurança valores monetários (formatos brasileiros ou internacionais)
-    para número float de precisão decimal.
+    para float de precisão decimal.
     Exemplos:
       - '1.250,50'   -> 1250.50
       - '-1.250,50'  -> -1250.50
       - 'R$ 1.250,50'-> 1250.50
+      - '+2.600,00'  -> 2600.00
+      - '2.600,00'   -> 2600.00
+      - '2.600'      -> 2600.00
       - '1.250,50 D' -> -1250.50
+      - '1.250,50 C' -> 1250.50
       - '(150,00)'   -> -150.00
       - '1250.50'    -> 1250.50
     """
@@ -224,6 +258,11 @@ def limpar_valor_monetario(val: Any) -> float:
     elif "," in cleaned:
         # Apenas vírgula como decimal: 150,50 -> 150.50
         cleaned = cleaned.replace(",", ".")
+    elif "." in cleaned:
+        # Se contiver apenas ponto, verifica se é milhar sem centavos (ex: 2.600)
+        parts = cleaned.split(".")
+        if len(parts) == 2 and len(parts[1]) == 3 and not ("," in s):
+            cleaned = parts[0] + parts[1]
 
     try:
         resultado = float(cleaned)
@@ -257,13 +296,12 @@ def converter_data_iso(val: Any) -> str:
 def ler_arquivo_csv(conteudo_bytes: bytes) -> pd.DataFrame:
     """
     Lê o conteúdo do arquivo CSV tratando codificações comuns (utf-8-sig, utf-8, latin1, cp1252)
-    e delimitadores (';', ',', '\t'). Ignora automaticamente eventuais linhas iniciais de
-    metadados que bancos inserem antes do cabeçalho de colunas.
+    e identificando com precisão cirúrgica a linha do cabeçalho da tabela (ignorando metadados de bancos).
+    Força e prioriza o delimitador ';' utilizado nos extratos de bancos brasileiros como o Banco Inter.
     """
     encodings = ["utf-8-sig", "utf-8", "latin1", "cp1252", "iso-8859-1"]
-    delimitadores = [";", ",", "\t", None]
-
     texto_decodificado = None
+
     for enc in encodings:
         try:
             texto_decodificado = conteudo_bytes.decode(enc)
@@ -278,20 +316,58 @@ def ler_arquivo_csv(conteudo_bytes: bytes) -> pd.DataFrame:
     if not linhas:
         raise ValueError("O arquivo CSV enviado está vazio.")
 
-    # Localiza a linha do cabeçalho caso o extrato contenha linhas iniciais de metadados
-    skip_linhas = 0
-    termos_cabecalho = ["data", "dt", "historico", "descricao", "valor", "lancamento"]
-    
-    for idx, linha in enumerate(linhas[:15]):
-        linha_norm = unicodedata.normalize('NFKD', linha).encode('ASCII', 'ignore').decode('utf-8').lower()
-        if any(termo in linha_norm for termo in termos_cabecalho) and (";" in linha or "," in linha or "\t" in linha):
-            skip_linhas = idx
-            break
+    # Termos característicos das colunas de tabelas de extrato bancário
+    termos_coluna = [
+        "data", "dt", "historico", "descricao", "valor", "saldo",
+        "lancamento", "debito", "credito", "documento", "movimento"
+    ]
 
-    texto_para_processar = "\n".join(linhas[skip_linhas:])
+    melhor_indice_cabecalho = 0
+    melhor_pontuacao = 0
+    delimitador_escolhido = ";"
 
+    # Varre as primeiras 35 linhas buscando a linha que mais contém termos típicos de cabeçalho
+    for idx, linha in enumerate(linhas[:35]):
+        linha_limpa = linha.strip()
+        if not linha_limpa:
+            continue
+
+        for delim in [";", ",", "\t"]:
+            if delim not in linha_limpa:
+                continue
+
+            tokens = [t.strip() for t in linha_limpa.split(delim) if t.strip()]
+            if len(tokens) < 2:
+                continue
+
+            pontos = 0
+            for t in tokens:
+                t_norm = unicodedata.normalize('NFKD', t).encode('ASCII', 'ignore').decode('utf-8').lower()
+                t_norm = re.sub(r'[^a-z0-9]', '', t_norm)
+                if any(termo in t_norm for termo in termos_coluna):
+                    pontos += 1
+
+            if pontos > melhor_pontuacao:
+                melhor_pontuacao = pontos
+                melhor_indice_cabecalho = idx
+                delimitador_escolhido = delim
+
+    logger.info(
+        f"Cabeçalho identificado na linha {melhor_indice_cabecalho} "
+        f"(pontuação={melhor_pontuacao}, delimitador='{delimitador_escolhido}'): "
+        f"'{linhas[melhor_indice_cabecalho]}'"
+    )
+
+    texto_para_processar = "\n".join(linhas[melhor_indice_cabecalho:])
+
+    # Tenta ler forçando o delimitador identificado (prioridade absoluta para ';')
     df_resultado = None
-    for delim in delimitadores:
+    tentativas_delim = [delimitador_escolhido]
+    if ";" not in tentativas_delim:
+        tentativas_delim.append(";")
+    tentativas_delim.extend([",", "\t", None])
+
+    for delim in tentativas_delim:
         try:
             df = pd.read_csv(
                 io.StringIO(texto_para_processar),
@@ -300,10 +376,13 @@ def ler_arquivo_csv(conteudo_bytes: bytes) -> pd.DataFrame:
                 dtype=str,
                 on_bad_lines="skip"
             )
+            # Remove eventuais colunas totalmente vazias geradas por delimitador no fim da linha
+            df = df.dropna(how="all", axis=1)
             if len(df.columns) >= 2 and len(df) > 0:
                 df_resultado = df
                 break
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Falha na tentativa com delimitador '{delim}': {e}")
             continue
 
     if df_resultado is None:
@@ -313,19 +392,23 @@ def ler_arquivo_csv(conteudo_bytes: bytes) -> pd.DataFrame:
             engine="python",
             dtype=str
         )
+        df_resultado = df_resultado.dropna(how="all", axis=1)
 
     return df_resultado
 
-def mapear_colunas_extrato(df: pd.DataFrame) -> tuple[str, str, Optional[str], Optional[str], Optional[str]]:
+def mapear_colunas_extrato(df: pd.DataFrame) -> Tuple[str, Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]]:
     """
-    Mapeia automaticamente colunas comuns em extratos de bancos brasileiros:
-    Data, Descrição, Valor Único ou Débito / Crédito separados.
+    Mapeia automaticamente colunas de extratos bancários brasileiros:
+    Data, Descrição, Valor, Débito, Crédito, Histórico e Saldo.
+    Garante que a coluna de Saldo NUNCA seja lida como coluna de Valor.
     """
     col_data = None
     col_descricao = None
     col_valor = None
     col_debito = None
     col_credito = None
+    col_historico = None
+    col_saldo = None
 
     def normalizar(col_nome: str) -> str:
         s = unicodedata.normalize('NFKD', str(col_nome)).encode('ASCII', 'ignore').decode('utf-8')
@@ -333,64 +416,91 @@ def mapear_colunas_extrato(df: pd.DataFrame) -> tuple[str, str, Optional[str], O
 
     colunas_map = {col: normalizar(col) for col in df.columns}
 
-    # 1. Identificar Coluna de Data
+    # 1. Identificar Coluna de Saldo (para ISOLAR e NUNCA ler como valor de movimentação)
+    for col, norm in colunas_map.items():
+        if "saldo" in norm or "balance" in norm:
+            col_saldo = col
+            break
+
+    # 2. Identificar Coluna de Data
     for col, norm in colunas_map.items():
         if norm in ["data", "date", "dt", "datalancamento", "datamovimento", "dtmovimento", "dtlancamento"]:
             col_data = col
             break
     if not col_data:
         for col, norm in colunas_map.items():
-            if "data" in norm or "date" in norm or norm.startswith("dt"):
+            if ("data" in norm or "date" in norm or norm.startswith("dt")) and col != col_saldo:
                 col_data = col
                 break
 
-    # 2. Identificar Colunas separadas de Débito e Crédito
+    # 3. Identificar Colunas separadas de Débito e Crédito
     for col, norm in colunas_map.items():
+        if col in [col_data, col_saldo]:
+            continue
         if "debito" in norm or norm in ["saida", "saidas"]:
             col_debito = col
         elif "credito" in norm or norm in ["entrada", "entradas"]:
             col_credito = col
 
-    # 3. Identificar Coluna de Valor único
+    # 4. Identificar Coluna de Valor Único (NUNCA pode ser col_saldo)
+    # Prioridade 1: Exatamente 'valor', 'valorr$', 'valortransacao'
     for col, norm in colunas_map.items():
-        if "saldo" in norm or "balance" in norm:
+        if col in [col_data, col_saldo] or "saldo" in norm or "balance" in norm:
             continue
-        if norm in ["valor", "valorr", "value", "amount", "quantia", "valortransacao"]:
+        if norm in ["valor", "valorr", "valorrs", "value", "amount", "quantia", "valortransacao", "valormovimento", "valorlancamento"]:
             col_valor = col
             break
+
+    # Prioridade 2: Contém 'valor', 'amount', 'quantia'
     if not col_valor:
         for col, norm in colunas_map.items():
-            if ("valor" in norm or "amount" in norm or "quantia" in norm) and "saldo" not in norm:
+            if col in [col_data, col_saldo] or "saldo" in norm or "balance" in norm:
+                continue
+            if ("valor" in norm or "amount" in norm or "quantia" in norm):
                 col_valor = col
                 break
 
-    # 4. Identificar Coluna de Descrição / Histórico
+    # 5. Identificar Coluna de Histórico e Coluna de Descrição
     for col, norm in colunas_map.items():
-        if col in [col_data, col_valor, col_debito, col_credito]:
+        if col in [col_data, col_valor, col_saldo, col_debito, col_credito]:
             continue
-        if norm in ["descricao", "historico", "lancamento", "titulo", "estabelecimento", "memo", "detalhes"]:
+        if "historico" in norm or norm.startswith("hist"):
+            col_historico = col
+        elif any(termo in norm for termo in ["desc", "titulo", "detalhe", "memo", "estab", "transacao"]):
             col_descricao = col
-            break
-    if not col_descricao:
-        for col, norm in colunas_map.items():
-            if col in [col_data, col_valor, col_debito, col_credito]:
-                continue
-            if any(termo in norm for termo in ["desc", "hist", "titulo", "detalhe", "memo", "transacao"]):
-                col_descricao = col
-                break
 
-    # Fallbacks inteligentes caso os cabeçalhos não correspondam às palavras mais comuns
+    # Preenchimento de colunas restantes se necessário
+    sobras = [
+        c for c in df.columns
+        if c not in [col_data, col_valor, col_saldo, col_debito, col_credito, col_historico, col_descricao]
+    ]
+
+    if not col_descricao and not col_historico:
+        if sobras:
+            col_descricao = sobras[0]
+    elif not col_descricao and col_historico and sobras:
+        col_descricao = sobras[0]
+    elif not col_historico and col_descricao and sobras:
+        col_historico = sobras[0]
+
+    # Validação mínima obrigatória de col_data
     if not col_data:
-        col_data = df.columns[0]
-    
-    if not col_descricao:
-        candidatos = [c for c in df.columns if c not in [col_data, col_valor, col_debito, col_credito]]
-        col_descricao = candidatos[0] if candidatos else df.columns[min(1, len(df.columns) - 1)]
+        candidatos = [c for c in df.columns if c != col_saldo]
+        col_data = candidatos[0] if candidatos else df.columns[0]
 
+    # Se col_valor não foi achado e não há debito/credito, busca coluna numérica excluindo saldo
     if not col_valor and not (col_debito and col_credito):
-        col_valor = df.columns[-1]
+        candidatos = [
+            c for c in df.columns
+            if c not in [col_data, col_saldo, col_descricao, col_historico] and "saldo" not in colunas_map.get(c, "")
+        ]
+        if candidatos:
+            col_valor = candidatos[-1]
+        else:
+            if df.columns[-1] != col_saldo and "saldo" not in colunas_map.get(df.columns[-1], ""):
+                col_valor = df.columns[-1]
 
-    return col_data, col_descricao, col_valor, col_debito, col_credito
+    return col_data, col_descricao, col_valor, col_debito, col_credito, col_historico, col_saldo
 
 # ==============================================================================
 # 6. ROTAS DA API
@@ -423,9 +533,9 @@ async def processar_extrato(
     x_user_id: Optional[str] = Header(None, alias="X-User-Id", description="ID do usuário via Header (alternativo)")
 ):
     """
-    Recebe um extrato bancário em CSV, lê os dados com Pandas tratando codificação e delimitadores,
-    mapeia automaticamente colunas de data/descrição/valor, executa o motor de categorização
-    por palavras-chave e devolve uma prévia limpa e estruturada para conferência do usuário.
+    Recebe um extrato bancário em CSV, lê com Pandas pulando metadados de bancos (ex: Banco Inter),
+    mapeia automaticamente colunas de data/histórico/descrição/valor, aplica auto-categorização inteligente
+    assegurando a contabilização de entradas, estornos e resgates, e devolve a prévia estruturada.
     """
     # 1. Validação da extensão do arquivo
     nome_arquivo = file.filename or ""
@@ -446,7 +556,7 @@ async def processar_extrato(
                 detail="O arquivo enviado está vazio."
             )
 
-        # 2. Leitura com Pandas
+        # 2. Leitura com Pandas tratando delimitadores e ignorando metadados
         df = ler_arquivo_csv(conteudo_bytes)
         if df.empty:
             raise HTTPException(
@@ -454,34 +564,49 @@ async def processar_extrato(
                 detail="Não foi possível identificar linhas de transação válidas no arquivo CSV."
             )
 
-        # 3. Mapeamento automático de colunas
-        col_data, col_desc, col_valor, col_deb, col_cred = mapear_colunas_extrato(df)
+        # 3. Mapeamento automático de colunas isolando col_saldo de col_valor
+        col_data, col_desc, col_valor, col_deb, col_cred, col_hist, col_saldo = mapear_colunas_extrato(df)
         logger.info(
-            f"Colunas mapeadas: Data='{col_data}', Descrição='{col_desc}', "
-            f"Valor='{col_valor}', Débito='{col_deb}', Crédito='{col_cred}'"
+            f"Colunas mapeadas: Data='{col_data}', Descrição='{col_desc}', Histórico='{col_hist}', "
+            f"Valor='{col_valor}', Saldo='{col_saldo}' (ignorado no cálculo), Débito='{col_deb}', Crédito='{col_cred}'"
         )
 
         transacoes: List[TransacaoItem] = []
         soma_receitas = 0.0
         soma_despesas = 0.0
 
-        # 4. Processamento das linhas
+        # 4. Processamento linha a linha das transações
         for _, row in df.iterrows():
             raw_data = row.get(col_data)
-            raw_desc = row.get(col_desc)
+            raw_desc = row.get(col_desc) if col_desc and col_desc in row else None
+            raw_hist = row.get(col_hist) if col_hist and col_hist in row else None
 
             # Ignora linhas totalmente nulas
-            if pd.isna(raw_data) and pd.isna(raw_desc):
+            if pd.isna(raw_data) and pd.isna(raw_desc) and pd.isna(raw_hist):
                 continue
 
             data_iso = converter_data_iso(raw_data)
-            descricao = str(raw_desc).strip() if pd.notna(raw_desc) else ""
+
+            # Monta descrição unificada (Histórico + Descrição)
+            partes_desc = []
+            if raw_hist and pd.notna(raw_hist):
+                h_str = str(raw_hist).strip()
+                if h_str and h_str.lower() != "nan":
+                    partes_desc.append(h_str)
+
+            if raw_desc and pd.notna(raw_desc):
+                d_str = str(raw_desc).strip()
+                if d_str and d_str.lower() != "nan":
+                    if not partes_desc or d_str.upper() != partes_desc[0].upper():
+                        partes_desc.append(d_str)
+
+            descricao = " - ".join(partes_desc) if partes_desc else ""
 
             # Descarta linhas sem informações mínimas
             if not data_iso and not descricao:
                 continue
 
-            # Cálculo e normalização do valor monetário
+            # Cálculo do valor numérico (NUNCA usa a coluna de saldo)
             if col_valor and col_valor in row:
                 valor_float = limpar_valor_monetario(row[col_valor])
             elif col_deb and col_cred and (col_deb in row or col_cred in row):
@@ -495,21 +620,21 @@ async def processar_extrato(
             if valor_float == 0.0 and not descricao:
                 continue
 
-            # 5. Aplicação do Motor de Categorização
-            tipo, categoria = auto_categorizar_transacao(descricao, valor_float)
+            # 5. Aplicação do Motor de Categorização com garantia de entradas para Estornos e Resgates
+            tipo, categoria, valor_ajustado = auto_categorizar_transacao(descricao, valor_float)
 
-            # Acumula totais do resumo do extrato
-            if valor_float >= 0:
-                soma_receitas += valor_float
+            # Acumula totais do resumo (Entradas/Receitas vs Despesas)
+            if tipo == "Receita" or valor_ajustado >= 0:
+                soma_receitas += abs(valor_ajustado)
             else:
-                soma_despesas += abs(valor_float)
+                soma_despesas += abs(valor_ajustado)
 
             item = TransacaoItem(
                 id_temp=str(uuid.uuid4()),
                 user_id=resolved_user_id,
                 data=data_iso,
                 descricao=descricao,
-                valor=valor_float,
+                valor=valor_ajustado,
                 tipo=tipo,
                 categoria=categoria
             )
